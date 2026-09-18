@@ -84,6 +84,15 @@ _patch_clob_models()
 _patch_market_order_rounding()
 
 
+PUSD_TOKEN = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+USDC_E_TOKEN = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_NATIVE_TOKEN = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+
+ERC20_BAL_ABI = [
+    {"name": "balanceOf", "inputs": [{"name": "account", "type": "address"}], "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
+]
+
+
 class ClobTrader:
     def __init__(self):
         self.clob = None          # PolymarketClobClient — order placement
@@ -149,45 +158,123 @@ class ClobTrader:
             kwargs["rpc_url"] = rpc
         return PolymarketGaslessWeb3Client(**kwargs)
 
+    def _query_address_balances(self, address: str, w3) -> Dict[str, float]:
+        """Query pUSD, USDC.e, native USDC, MATIC, and Polymarket Data-API value for an address."""
+        from web3 import Web3
+        import httpx
 
-    def _candidate_wallets(self, gasless) -> List[Tuple[int, str]]:
-        """(signature_type, address) candidates derived from the EOA, deposit-wallet
-        (V2) first, then legacy proxy / safe."""
-        out: List[Tuple[int, str]] = []
-        for st, getter in (
-            (3, gasless.get_expected_deposit_wallet),
-            (1, gasless.get_poly_proxy_wallet_address),
-            (2, gasless.get_safe_proxy_wallet_address),
+        out = {
+            "pusd": 0.0,
+            "usdc_e": 0.0,
+            "usdc_native": 0.0,
+            "matic": 0.0,
+            "polymarket_value": 0.0,
+            "tradeable": 0.0,
+        }
+        if not address:
+            return out
+        try:
+            ca = Web3.to_checksum_address(address)
+        except Exception:
+            return out
+
+        try:
+            pusd = w3.eth.contract(address=Web3.to_checksum_address(PUSD_TOKEN), abi=ERC20_BAL_ABI)
+            out["pusd"] = float(pusd.functions.balanceOf(ca).call() / 1e6)
+        except Exception:
+            pass
+
+        try:
+            usdce = w3.eth.contract(address=Web3.to_checksum_address(USDC_E_TOKEN), abi=ERC20_BAL_ABI)
+            out["usdc_e"] = float(usdce.functions.balanceOf(ca).call() / 1e6)
+        except Exception:
+            pass
+
+        try:
+            usdcnat = w3.eth.contract(address=Web3.to_checksum_address(USDC_NATIVE_TOKEN), abi=ERC20_BAL_ABI)
+            out["usdc_native"] = float(usdcnat.functions.balanceOf(ca).call() / 1e6)
+        except Exception:
+            pass
+
+        try:
+            out["matic"] = float(w3.eth.get_balance(ca) / 1e18)
+        except Exception:
+            pass
+
+        try:
+            resp = httpx.get(f"https://data-api.polymarket.com/value?user={address}", timeout=3.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and data:
+                    out["polymarket_value"] = float(data[0].get("value", 0.0))
+        except Exception:
+            pass
+
+        out["tradeable"] = max(out["pusd"], out["usdc_e"], out["usdc_native"], out["polymarket_value"])
+        return out
+
+    def _candidate_wallets(self, gasless, eoa: Optional[str] = None) -> List[Tuple[int, str, str]]:
+        """(signature_type, address, label) candidates derived from the EOA:
+        - Signature Type 3: Deposit Wallet V2 (Polymarket)
+        - Signature Type 0: EOA / Signer (MetaMask)
+        - Signature Type 1: Poly Proxy (V1)
+        - Signature Type 2: Safe Proxy
+        """
+        out: List[Tuple[int, str, str]] = []
+        try:
+            dep = gasless.get_expected_deposit_wallet()
+            if dep:
+                out.append((3, dep, "Deposit Wallet (V2)"))
+        except Exception:
+            pass
+
+        if eoa:
+            out.append((0, eoa, "EOA / Signer (MetaMask)"))
+
+        for st, getter, label in (
+            (1, gasless.get_poly_proxy_wallet_address, "Polymarket Proxy (V1)"),
+            (2, gasless.get_safe_proxy_wallet_address, "Gnosis Safe"),
         ):
             try:
-                out.append((st, getter()))
+                addr = getter()
+                if addr:
+                    out.append((st, addr, label))
             except Exception:
                 pass
         return out
 
-    def _pick_funded_wallet(self, gasless) -> Tuple[int, str]:
-        """Trade from where the money actually is: pick the candidate holding pUSD.
+    def _pick_funded_wallet(self, gasless, eoa: Optional[str] = None) -> Tuple[int, str]:
+        """Trade from where the money actually is: pick candidate with detected funds.
         Falls back to the deposit wallet when every balance reads 0."""
-        best = None  # (sig_type, addr, balance)
-        for st, addr in self._candidate_wallets(gasless):
-            try:
-                bal = float(gasless.get_pusd_balance(address=addr))
-            except Exception:
-                bal = 0.0
-            if bal > 0:
-                return st, addr
-            if best is None or bal > best[2]:
-                best = (st, addr, bal)
-        if best:
-            return best[0], best[1]
-        return 3, gasless.get_expected_deposit_wallet()
+        best_sig = 3
+        best_funder = None
+        best_bal = 0.0
+
+        candidates = self._candidate_wallets(gasless, eoa=eoa)
+        w3 = gasless.w3
+        for st, addr, _ in candidates:
+            bals = self._query_address_balances(addr, w3)
+            bal = bals.get("tradeable", 0.0)
+            if bal > best_bal:
+                best_bal = bal
+                best_sig = st
+                best_funder = addr
+
+        if best_funder and best_bal > 0:
+            return best_sig, best_funder
+
+        try:
+            return 3, gasless.get_expected_deposit_wallet()
+        except Exception:
+            return 3, eoa or ""
 
     def _init_clients(self):
         from polymarket_apis.clients.clob_client import PolymarketClobClient
+        from eth_account import Account
 
-        # Any gasless client can derive every candidate address; probe with deposit.
+        eoa = Account.from_key(settings.PRIVATE_KEY).address
         probe = self._new_gasless(3)
-        sig_type, funder = self._pick_funded_wallet(probe)
+        sig_type, funder = self._pick_funded_wallet(probe, eoa=eoa)
 
         gasless = probe if sig_type == 3 else self._new_gasless(sig_type)
 
@@ -465,9 +552,11 @@ class ClobTrader:
     def test_connection(self, private_key: Optional[str] = None,
                         relayer_api_key: Optional[str] = None,
                         alchemy_api_key: Optional[str] = None) -> Dict[str, Any]:
-        """Derive the EOA + its candidate wallets and report pUSD balances — shows
-        which wallet holds the funds and which signature type will be used. Read-only
-        (no relayer key required). Supports testing unsaved credentials."""
+        """Derive the EOA + candidate wallets (Deposit V2, EOA, Proxy, Safe) and report
+        balances across pUSD, USDC.e, native USDC, and Polymarket Data-API value.
+        Read-only (no relayer key required). Supports testing unsaved credentials."""
+        from concurrent.futures import ThreadPoolExecutor
+
         pk = normalize_private_key(private_key) if private_key else settings.PRIVATE_KEY
         if not pk:
             return {"ok": False, "error": "missing_private_key",
@@ -481,28 +570,59 @@ class ClobTrader:
             rk = (relayer_api_key or "").strip() if relayer_api_key is not None else settings.RELAYER_API_KEY
             ak = (alchemy_api_key or "").strip() if alchemy_api_key is not None else settings.ALCHEMY_API_KEY
             probe = self._new_gasless_custom(3, pk, rk, ak)
-            wallets = []
+
+            candidates = self._candidate_wallets(probe, eoa=eoa)
+            w3 = probe.w3
+
+            def fetch_wallet_info(item):
+                st, addr, label = item
+                bals = self._query_address_balances(addr, w3)
+                return {
+                    "signature_type": st,
+                    "address": addr,
+                    "label": label,
+                    "pusd_balance": bals["pusd"],
+                    "usdce_balance": bals["usdc_e"],
+                    "usdc_native_balance": bals["usdc_native"],
+                    "polymarket_value": bals["polymarket_value"],
+                    "matic_balance": bals["matic"],
+                    "tradeable_balance": bals["tradeable"],
+                    "has_funds": bals["tradeable"] > 0
+                }
+
+            with ThreadPoolExecutor(max_workers=min(4, max(1, len(candidates)))) as pool:
+                wallets = list(pool.map(fetch_wallet_info, candidates))
+
             best_sig = 3
             best_funder = None
-            best_bal = -1.0
+            best_bal = 0.0
+            total_detected = 0.0
 
-            for st, addr in self._candidate_wallets(probe):
-                try:
-                    bal = float(probe.get_pusd_balance(address=addr))
-                except Exception:
-                    bal = None
-                wallets.append({"signature_type": st, "address": addr, "pusd_balance": bal})
-                if bal is not None and bal > best_bal:
-                    best_bal = bal
-                    best_sig = st
-                    best_funder = addr
+            for w in wallets:
+                tb = w["tradeable_balance"]
+                total_detected += tb
+                if tb > best_bal:
+                    best_bal = tb
+                    best_sig = w["signature_type"]
+                    best_funder = w["address"]
 
             if best_funder is None or best_bal <= 0:
                 best_sig = 3
                 try:
                     best_funder = probe.get_expected_deposit_wallet()
                 except Exception:
-                    best_funder = None
+                    best_funder = eoa
+
+            advisory = ""
+            if total_detected > 0:
+                if best_sig == 3:
+                    advisory = f"Funds detected in your Polymarket Deposit Wallet (${best_bal:.2f}). Ready for live trading!"
+                elif best_sig == 0:
+                    advisory = f"Funds detected in your EOA (${best_bal:.2f}). To trade gasless on Polymarket V2, deposit your USDC to your Polymarket Deposit Wallet address ({best_funder})."
+                else:
+                    advisory = f"Funds detected in your Proxy/Safe wallet (${best_bal:.2f})."
+            else:
+                advisory = "No funds detected across your derived Polygon addresses ($0.00). If you see funds on polymarket.com, did you sign in with Google or Email? (Google logins use an embedded Magic wallet with a different address). Check your address on polymarket.com -> Profile."
 
             return {
                 "ok": True,
@@ -510,22 +630,28 @@ class ClobTrader:
                 "chosen_signature_type": best_sig,
                 "funder": best_funder,
                 "relayer_key_set": bool(rk),
+                "total_detected_funds": round(total_detected, 2),
+                "advisory": advisory,
                 "wallets": wallets,
             }
         except Exception as e:
             return {"ok": False, "eoa": eoa, "error": f"{type(e).__name__}: {e}"}
 
     def get_usdc_balance(self) -> Optional[float]:
-        """pUSD balance of the funded wallet (dollars), or None. pUSD is Polymarket's
-        V2 collateral; this is the deposit wallet's tradeable balance."""
+        """Tradeable balance of the funded wallet (dollars), checking pUSD, USDC.e,
+        native USDC, and Polymarket portfolio value."""
         if not settings.PRIVATE_KEY:
             return None
         try:
+            from eth_account import Account
+            eoa = Account.from_key(settings.PRIVATE_KEY).address
             if self.ready and self.gasless is not None and self.funder:
-                return float(self.gasless.get_pusd_balance(address=self.funder))
+                bals = self._query_address_balances(self.funder, self.gasless.w3)
+                return float(bals.get("tradeable", 0.0))
             probe = self._new_gasless(3)
-            _, funder = self._pick_funded_wallet(probe)
-            return float(probe.get_pusd_balance(address=funder))
+            sig_type, funder = self._pick_funded_wallet(probe, eoa=eoa)
+            bals = self._query_address_balances(funder, probe.w3)
+            return float(bals.get("tradeable", 0.0))
         except Exception:
             return None
 

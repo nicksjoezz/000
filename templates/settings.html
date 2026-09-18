@@ -212,15 +212,13 @@
                     <div>
                         <div class="flex justify-between items-center mb-2">
                             <label class="block text-gray-400 text-xs sm:text-sm uppercase font-bold tracking-wider">Private Key or Seed Phrase</label>
-                            <span x-show="keyInspection && keyInspection.valid" class="text-[10px] font-bold uppercase text-green-400 bg-green-950/70 border border-green-800 px-2 py-0.5 rounded" x-text="keyInspection.message"></span>
-                            <span x-show="keyInspection && !keyInspection.valid && form.private_key" class="text-[10px] font-bold uppercase text-amber-400 bg-amber-950/70 border border-amber-800 px-2 py-0.5 rounded" x-text="keyInspection.message"></span>
+                            <span x-show="keyInspection && keyInspection.valid" class="text-[10px] font-bold uppercase text-green-400 bg-green-950/70 border border-green-800 px-2 py-0.5 rounded" x-text="keyInspection ? keyInspection.message : ''"></span>
+                            <span x-show="keyInspection && !keyInspection.valid && form.private_key" class="text-[10px] font-bold uppercase text-amber-400 bg-amber-950/70 border border-amber-800 px-2 py-0.5 rounded" x-text="keyInspection ? keyInspection.message : ''"></span>
                         </div>
                         <input type="password" x-model="form.private_key" @input.debounce.300ms="onKeyInput" @change="onKeyInput" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition font-mono text-sm" placeholder="0x...  or  twelve/twenty-four word seed phrase">
                         <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mt-2 gap-1 text-[10px]">
                             <p class="text-gray-400 italic">Your trading wallet is <strong>derived</strong> from this. It signs every order but holds no funds and needs no gas.</p>
-                            <template x-if="keyInspection && keyInspection.eoa">
-                                <span class="font-mono text-blue-400 truncate max-w-xs" x-text="'EOA: ' + keyInspection.eoa"></span>
-                            </template>
+                            <span x-show="keyInspection && keyInspection.eoa" class="font-mono text-blue-400 truncate max-w-xs" x-text="keyInspection && keyInspection.eoa ? ('EOA: ' + keyInspection.eoa) : ''"></span>
                         </div>
                     </div>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
@@ -290,26 +288,86 @@
                                 <h4 class="text-xs uppercase font-bold tracking-wider text-blue-400">Derived Wallets on Polygon</h4>
                                 <span class="text-[10px] font-mono text-gray-400" x-text="'EOA Signer: ' + (eoa || '-')"></span>
                             </div>
-                            <div class="text-right">
-                                <span class="text-xs text-gray-400 uppercase font-bold">Active Live pUSD:</span>
-                                <span class="text-sm font-mono font-bold text-green-400 ml-1"
-                                      x-text="'$' + (chosenBalance != null ? chosenBalance.toFixed(2) : '0.00')"></span>
+                            <div class="text-left sm:text-right">
+                                <div class="flex items-center sm:justify-end gap-2">
+                                    <span class="text-[11px] text-gray-400 uppercase font-bold">Total Detected:</span>
+                                    <span class="text-sm font-mono font-bold"
+                                          :class="totalDetectedFunds > 0 ? 'text-green-400' : 'text-gray-400'"
+                                          x-text="'$' + (totalDetectedFunds != null ? Number(totalDetectedFunds).toFixed(2) : '0.00')"></span>
+                                </div>
+                                <div class="text-[10px] text-gray-500">
+                                    Active Funder: <span class="text-blue-400 font-mono" x-text="'$' + (chosenBalance != null ? Number(chosenBalance).toFixed(2) : '0.00')"></span>
+                                </div>
                             </div>
                         </div>
-                        <div class="space-y-1.5">
+
+                        <!-- Wallets list -->
+                        <div class="space-y-2">
                             <template x-for="w in wallets" :key="w.address">
-                                <div class="flex items-center justify-between text-xs font-mono py-1.5 px-2 rounded"
-                                     :class="w.address === chosenFunder ? 'bg-gray-800/80 border border-green-700/60' : 'hover:bg-gray-800/40'">
-                                    <div class="flex items-center gap-2 min-w-0">
-                                        <span :class="w.address === chosenFunder ? 'text-green-400 font-bold' : 'text-gray-400'"
-                                              x-text="(w.address === chosenFunder ? '✓ ' : '  ') + labelFor(w.signature_type)"></span>
-                                        <span class="text-gray-400 truncate max-w-[180px] sm:max-w-xs" x-text="w.address"></span>
+                                <div class="p-2.5 rounded-lg border transition"
+                                     :class="w.address === chosenFunder ? 'bg-gray-800/90 border-green-700/80 shadow-sm' : 'bg-gray-900/40 border-gray-800 hover:border-gray-700'">
+                                    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5">
+                                        <div class="flex items-center gap-2 min-w-0">
+                                            <span class="text-xs font-bold shrink-0"
+                                                  :class="w.address === chosenFunder ? 'text-green-400' : 'text-gray-400'"
+                                                  x-text="(w.address === chosenFunder ? '✓ ' : '  ') + (w.label || labelFor(w.signature_type))"></span>
+                                            <span class="text-gray-400 font-mono text-[11px] truncate max-w-[200px] sm:max-w-xs select-all" x-text="w.address"></span>
+                                        </div>
+                                        <div class="flex items-center gap-2 justify-between sm:justify-end">
+                                            <span class="text-xs font-mono font-bold"
+                                                  :class="(w.tradeable_balance || w.pusd_balance) > 0 ? 'text-green-400' : 'text-gray-500'"
+                                                  x-text="'$' + Number(w.tradeable_balance != null ? w.tradeable_balance : (w.pusd_balance || 0)).toFixed(2)"></span>
+                                        </div>
                                     </div>
-                                    <span :class="w.pusd_balance > 0 ? 'text-green-400 font-bold' : 'text-gray-500'"
-                                          x-text="w.pusd_balance == null ? '?' : ('$' + Number(w.pusd_balance).toFixed(2))"></span>
+                                    <!-- Token Breakdown Chips -->
+                                    <div class="flex flex-wrap items-center gap-1.5 mt-1.5 text-[10px] font-mono">
+                                        <span x-show="w.pusd_balance > 0" class="bg-blue-950/80 text-blue-300 border border-blue-800/80 px-1.5 py-0.5 rounded"
+                                              x-text="'pUSD: $' + Number(w.pusd_balance).toFixed(2)"></span>
+                                        <span x-show="w.usdce_balance > 0" class="bg-emerald-950/80 text-emerald-300 border border-emerald-800/80 px-1.5 py-0.5 rounded"
+                                              x-text="'USDC.e: $' + Number(w.usdce_balance).toFixed(2)"></span>
+                                        <span x-show="w.usdc_native_balance > 0" class="bg-purple-950/80 text-purple-300 border border-purple-800/80 px-1.5 py-0.5 rounded"
+                                              x-text="'Native USDC: $' + Number(w.usdc_native_balance).toFixed(2)"></span>
+                                        <span x-show="w.polymarket_value > 0" class="bg-amber-950/80 text-amber-300 border border-amber-800/80 px-1.5 py-0.5 rounded"
+                                              x-text="'Polymarket Value: $' + Number(w.polymarket_value).toFixed(2)"></span>
+                                        <span x-show="w.matic_balance > 0" class="text-gray-400 px-1"
+                                              x-text="'POL: ' + Number(w.matic_balance).toFixed(3)"></span>
+                                        <span x-show="!w.pusd_balance && !w.usdce_balance && !w.usdc_native_balance && !w.polymarket_value" class="text-gray-600 italic">
+                                            $0.00 across pUSD &amp; USDC tokens
+                                        </span>
+                                    </div>
                                 </div>
                             </template>
                         </div>
+
+                        <!-- Advisory notice when 0 funds detected -->
+                        <div x-show="totalDetectedFunds <= 0" class="mt-3 p-3 bg-amber-950/40 border border-amber-800/80 rounded-lg text-xs text-amber-200">
+                            <p class="font-bold flex items-center gap-1.5 mb-1 text-amber-300">
+                                <span>ℹ</span> No Funds Detected on Derived Polygon Addresses ($0.00)
+                            </p>
+                            <p class="text-[11px] text-gray-300 mb-1.5 leading-relaxed">
+                                If you have funds on Polymarket, please verify the following:
+                            </p>
+                            <ul class="list-disc list-inside space-y-1 text-[11px] text-gray-400 leading-relaxed">
+                                <li>
+                                    <strong class="text-gray-200">Google / Email login:</strong> If you signed in to <span class="text-blue-400">polymarket.com</span> using Google or Email, Polymarket automatically created an embedded Magic Link wallet. That has a different address from this seed phrase. Visit <span class="text-white font-mono">polymarket.com -> Profile</span> to view your actual Polymarket deposit address.
+                                </li>
+                                <li>
+                                    <strong class="text-gray-200">Polymarket V2 Deposit Wallet:</strong> In Polymarket V2, your funds must be in your derived Deposit Wallet (<span class="text-white font-mono" x-text="chosenFunder"></span>) or EOA on the <strong>Polygon</strong> network.
+                                </li>
+                                <li>
+                                    <strong class="text-gray-200">Network:</strong> Ensure your USDC was deposited on the <strong>Polygon (PoS)</strong> network, not Ethereum or Arbitrum.
+                                </li>
+                            </ul>
+                        </div>
+
+                        <!-- Advisory notice when funds ARE detected -->
+                        <div x-show="totalDetectedFunds > 0" class="mt-3 p-3 bg-green-950/40 border border-green-800/80 rounded-lg text-xs text-green-200">
+                            <p class="font-bold flex items-center gap-1.5 mb-1 text-green-300">
+                                <span>✓</span> Funds Detected!
+                            </p>
+                            <p class="text-[11px] text-gray-300 leading-relaxed" x-text="walletAdvisory"></p>
+                        </div>
+
                         <div class="mt-3 pt-2 border-t border-gray-800 text-[10px] text-gray-400 flex flex-col sm:flex-row justify-between gap-2">
                             <span>✓ Ticked wallet will be used for orders.</span>
                             <span class="text-amber-400 italic">To trade with this balance, select "Live Trading" under Mode above and click Save Changes.</span>
@@ -353,10 +411,12 @@
                 eoa: '',
                 chosenFunder: '',
                 chosenBalance: 0.0,
+                totalDetectedFunds: 0.0,
+                walletAdvisory: '',
                 walletMessage: '',
                 walletOk: false,
                 walletDetail: '',
-                keyInspection: null,
+                keyInspection: { valid: false, message: '', eoa: '', type: '' },
                 tgBusy: false,
                 tgSubs: [],
                 tgSubsBusy: false,
@@ -385,11 +445,11 @@
                 async onKeyInput() {
                     const val = (this.form.private_key || '').trim();
                     if (!val) {
-                        this.keyInspection = null;
+                        this.keyInspection = { valid: false, message: '', eoa: '', type: '' };
                         return;
                     }
                     if (val.includes('...')) {
-                        this.keyInspection = { valid: true, type: 'stored', message: 'Saved key active' };
+                        this.keyInspection = { valid: true, type: 'stored', message: 'Saved key active', eoa: this.eoa || '' };
                         return;
                     }
                     try {
@@ -398,12 +458,13 @@
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ private_key: val })
                         });
-                        this.keyInspection = await res.json();
+                        const data = await res.json();
+                        this.keyInspection = data || { valid: false, message: '', eoa: '', type: '' };
                         if (this.keyInspection && this.keyInspection.eoa) {
                             this.eoa = this.keyInspection.eoa;
                         }
                     } catch (e) {
-                        this.keyInspection = null;
+                        this.keyInspection = { valid: false, message: '', eoa: '', type: '' };
                     }
                 },
                 getCredentialPayload() {
@@ -473,7 +534,7 @@
                     }
                 },
                 labelFor(t) {
-                    return t === 3 ? 'Deposit Wallet (V2)' : (t === 1 ? 'Polymarket Proxy' : (t === 2 ? 'Gnosis Safe' : 'Wallet ' + t));
+                    return t === 3 ? 'Deposit Wallet (V2)' : (t === 0 ? 'EOA / Signer (MetaMask)' : (t === 1 ? 'Polymarket Proxy (V1)' : (t === 2 ? 'Gnosis Safe' : 'Wallet ' + t)));
                 },
                 // Read-only: derives wallets on Polygon and checks live balances.
                 async testConnection() {
@@ -493,10 +554,12 @@
                             this.wallets = data.wallets || [];
                             this.eoa = data.eoa || '';
                             this.chosenFunder = data.funder || '';
+                            this.totalDetectedFunds = data.total_detected_funds != null ? Number(data.total_detected_funds) : 0.0;
+                            this.walletAdvisory = data.advisory || '';
                             const matched = (this.wallets || []).find(w => w.address === data.funder);
-                            this.chosenBalance = matched?.pusd_balance != null ? Number(matched.pusd_balance) : 0.0;
+                            this.chosenBalance = matched?.tradeable_balance != null ? Number(matched.tradeable_balance) : (matched?.pusd_balance != null ? Number(matched.pusd_balance) : 0.0);
                             this.walletOk = true;
-                            this.walletMessage = "Connection verified! Trading from " + this.labelFor(data.chosen_signature_type);
+                            this.walletMessage = "Connection verified! Active trading wallet: " + this.labelFor(data.chosen_signature_type);
                             this.walletDetail = "EOA Signer: " + data.eoa + " | Active Funder: " + data.funder + (data.relayer_key_set ? " | Relayer API Key: Set" : " | Relayer API Key: None (gasless setup requires relayer key)");
                             this.flash("Connection verified (" + this.labelFor(data.chosen_signature_type) + ")", 'success');
                         } else {
