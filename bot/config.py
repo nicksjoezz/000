@@ -1,7 +1,7 @@
 import os
 import json
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
@@ -121,21 +121,75 @@ class Settings(BaseSettings):
     ALL_PROXY: str = os.getenv("ALL_PROXY", os.getenv("all_proxy", ""))
 
 def normalize_private_key(secret: str) -> str:
-    """Accept either a raw hex private key or a 12/24-word seed phrase and return a
+    """Accept either a raw hex private key or a 12/15/18/21/24-word seed phrase and return a
     hex private key. EOA only — the trading wallet is derived from this secret and
     nothing else. Returns "" for empty input. Raises if a seed phrase can't be parsed."""
-    secret = (secret or "").strip()
+    secret = (secret or "").strip().strip('"\'')
     if not secret:
         return ""
-    # A mnemonic is several space-separated words; a private key is a single token.
-    if len(secret.split()) >= 12:
+    words = secret.split()
+    if len(words) in (12, 15, 18, 21, 24) or (len(words) >= 12 and not secret.startswith("0x")):
         from eth_account import Account
         Account.enable_unaudited_hdwallet_features()
-        key = Account.from_mnemonic(secret).key.hex()
-        # hexbytes >= 1.0 returns bare hex; older returns it 0x-prefixed. Normalise so
-        # a derived key looks exactly like a pasted one downstream.
+        clean_mnemonic = " ".join(words)
+        key = Account.from_mnemonic(clean_mnemonic).key.hex()
         return key if key.startswith("0x") else "0x" + key
-    return secret
+
+    cleaned_hex = secret if secret.startswith("0x") else "0x" + secret
+    return cleaned_hex
+
+
+def inspect_key_or_mnemonic(secret: str) -> Dict[str, Any]:
+    """Inspect and validate a private key or mnemonic without mutating settings."""
+    secret = (secret or "").strip().strip('"\'')
+    if not secret:
+        return {"valid": False, "type": "empty", "message": "No key or seed phrase entered"}
+    words = secret.split()
+    if len(words) >= 12 and not secret.startswith("0x"):
+        if len(words) not in (12, 15, 18, 21, 24):
+            return {
+                "valid": False,
+                "type": "seed_phrase",
+                "word_count": len(words),
+                "message": f"Seed phrase has {len(words)} words (expected 12 or 24)"
+            }
+        try:
+            from eth_account import Account
+            Account.enable_unaudited_hdwallet_features()
+            clean_mnemonic = " ".join(words)
+            acc = Account.from_mnemonic(clean_mnemonic)
+            return {
+                "valid": True,
+                "type": "seed_phrase",
+                "word_count": len(words),
+                "eoa": acc.address,
+                "message": f"Valid {len(words)}-word seed phrase"
+            }
+        except Exception as e:
+            return {
+                "valid": False,
+                "type": "seed_phrase",
+                "word_count": len(words),
+                "message": f"Invalid seed phrase: {e}"
+            }
+    else:
+        try:
+            from eth_account import Account
+            raw = secret if secret.startswith("0x") else "0x" + secret
+            acc = Account.from_key(raw)
+            return {
+                "valid": True,
+                "type": "private_key",
+                "eoa": acc.address,
+                "message": "Valid private key"
+            }
+        except Exception as e:
+            return {
+                "valid": False,
+                "type": "private_key",
+                "message": f"Invalid private key: {e}"
+            }
+
 
 
 def load_settings():

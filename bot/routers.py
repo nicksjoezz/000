@@ -7,7 +7,7 @@ from fastapi import APIRouter, Request, WebSocket, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 
-from .config import settings, normalize_private_key
+from .config import settings, normalize_private_key, inspect_key_or_mnemonic
 from .state import state, log_message
 from .clob_trader import clob_trader
 from .telegram_service import send_telegram, remove_telegram_subscriber
@@ -195,7 +195,7 @@ async def post_settings(new_settings: Dict[str, Any]):
             settings.PRIVATE_KEY = normalize_private_key(new_pk)
             new_settings["private_key"] = settings.PRIVATE_KEY
         except Exception as e:
-            return {"status": "error", "error": f"invalid_private_key: {e}"}
+            raise HTTPException(status_code=400, detail=f"Invalid private key or seed phrase: {e}")
 
     existing_cfg = {}
     if os.path.exists("config.json"):
@@ -286,44 +286,64 @@ async def post_settings(new_settings: Dict[str, Any]):
 
     return {"status": "ok"}
 
+@router.post("/api/validate-key")
+async def validate_key(body: Dict[str, Any]):
+    secret = str(body.get("private_key", "")).strip()
+    return inspect_key_or_mnemonic(secret)
+
 @router.post("/api/setup-wallet")
-async def setup_wallet():
+async def setup_wallet(body: Optional[Dict[str, Any]] = None):
+    body = body or {}
+    pk = body.get("private_key")
+    rk = body.get("relayer_api_key")
+    ak = body.get("alchemy_api_key")
     try:
-        result = await asyncio.to_thread(clob_trader.ensure_setup)
+        result = await asyncio.to_thread(clob_trader.ensure_setup, pk, rk, ak)
         if result.get("ok"):
             if result.get("skipped"):
                 log_message("Wallet setup: already done this session")
             else:
                 log_message(f"Wallet setup complete ({result.get('approvals', 0)} approvals)")
         else:
-            log_message(f"Wallet setup failed: {result.get('error')}")
+            msg = result.get("message") or result.get("error")
+            log_message(f"Wallet setup failed: {msg}")
         return result
     except Exception as e:
         log_message(f"Wallet setup error: {e}")
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "message": str(e)}
 
 @router.post("/api/test-connection")
-async def test_connection():
+async def test_connection(body: Optional[Dict[str, Any]] = None):
+    body = body or {}
+    pk = body.get("private_key")
+    rk = body.get("relayer_api_key")
+    ak = body.get("alchemy_api_key")
     try:
-        result = await asyncio.to_thread(clob_trader.test_connection)
+        result = await asyncio.to_thread(clob_trader.test_connection, pk, rk, ak)
         if result.get("ok"):
             log_message(f"Connection OK — EOA {result.get('eoa')}, trading from "
                         f"{result.get('funder')} (sig type {result.get('chosen_signature_type')})")
         else:
-            log_message(f"Connection test failed: {result.get('error')}")
+            msg = result.get("message") or result.get("error")
+            log_message(f"Connection test failed: {msg}")
         return result
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "message": str(e)}
 
 @router.post("/api/enable-auto-redeem")
-async def enable_auto_redeem():
+async def enable_auto_redeem(body: Optional[Dict[str, Any]] = None):
+    body = body or {}
+    pk = body.get("private_key")
     try:
-        result = await asyncio.to_thread(clob_trader.enable_auto_redeem)
-        log_message("Auto-redeem enabled" if result.get("ok")
-                    else f"Auto-redeem failed: {result.get('error')}")
+        result = await asyncio.to_thread(clob_trader.enable_auto_redeem, pk)
+        if result.get("ok"):
+            log_message("Auto-redeem enabled")
+        else:
+            msg = result.get("message") or result.get("error")
+            log_message(f"Auto-redeem failed: {msg}")
         return result
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "message": str(e)}
 
 @router.get("/api/telegram-subscribers")
 async def get_telegram_subscribers():

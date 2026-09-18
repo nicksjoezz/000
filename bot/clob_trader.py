@@ -19,7 +19,7 @@ All clients are synchronous — call from the event loop via `asyncio.to_thread`
 
 import threading
 from typing import Optional, Dict, Any, List, Tuple
-from .config import settings
+from .config import settings, normalize_private_key
 
 
 def _to_float(x) -> Optional[float]:
@@ -124,19 +124,31 @@ class ClobTrader:
         return self._api_creds
 
     def _new_gasless(self, signature_type: int):
-        # Gasless on-chain client. Two distinct roles:
-        #   - relayer key (or builder creds): SUBMITS txs and pays the gas
-        #   - rpc_url: READS chain state (pUSD balance, wallet derivation). Use Alchemy
-        #     when configured, else the library default.
+        return self._new_gasless_custom(signature_type, settings.PRIVATE_KEY,
+                                         settings.RELAYER_API_KEY, settings.ALCHEMY_API_KEY)
+
+    def _new_gasless_custom(self, signature_type: int, private_key: str,
+                            relayer_api_key: str = "", alchemy_api_key: str = ""):
         from polymarket_apis.clients.web3_client import PolymarketGaslessWeb3Client
-        kwargs = {"private_key": settings.PRIVATE_KEY, "signature_type": signature_type}
-        if settings.RELAYER_API_KEY:
-            kwargs["relayer_api_key"] = settings.RELAYER_API_KEY
+        from polymarket_apis.clients.clob_client import PolymarketClobClient
+        from eth_account import Account
+
+        pk = normalize_private_key(private_key)
+        rk = relayer_api_key.strip() if relayer_api_key else settings.RELAYER_API_KEY
+        ak = alchemy_api_key.strip() if alchemy_api_key else settings.ALCHEMY_API_KEY
+        rpc = f"https://polygon-mainnet.g.alchemy.com/v2/{ak}" if ak else settings.alchemy_rpc_url()
+
+        kwargs = {"private_key": pk, "signature_type": signature_type}
+        if rk:
+            kwargs["relayer_api_key"] = rk
         else:
-            kwargs["builder_creds"] = self._derive_creds()
-        if settings.alchemy_rpc_url():
-            kwargs["rpc_url"] = settings.alchemy_rpc_url()
+            eoa = Account.from_key(pk).address
+            c = PolymarketClobClient(private_key=pk, address=eoa, chain_id=137, signature_type=3)
+            kwargs["builder_creds"] = c.create_or_derive_api_creds()
+        if rpc:
+            kwargs["rpc_url"] = rpc
         return PolymarketGaslessWeb3Client(**kwargs)
+
 
     def _candidate_wallets(self, gasless) -> List[Tuple[int, str]]:
         """(signature_type, address) candidates derived from the EOA, deposit-wallet
@@ -212,18 +224,26 @@ class ClobTrader:
                 self.clob = None
                 return False
 
-    def ensure_setup(self) -> Dict[str, Any]:
+    def ensure_setup(self, private_key: Optional[str] = None,
+                     relayer_api_key: Optional[str] = None,
+                     alchemy_api_key: Optional[str] = None) -> Dict[str, Any]:
         """One-time gasless on-chain setup: deploy the deposit wallet (if needed) and
         set token approvals, sponsored by the relayer key. Required once before the
         first live order on a fresh deposit wallet."""
-        if not self.ensure_ready():
-            return {"ok": False, "error": self.last_error or "client_not_ready"}
-        if self._approvals_done:
-            return {"ok": True, "skipped": "already_done"}
-        if not settings.RELAYER_API_KEY:
-            return {"ok": False, "error": "missing_relayer_api_key"}
+        pk = normalize_private_key(private_key) if private_key else settings.PRIVATE_KEY
+        rk = (relayer_api_key or "").strip() if relayer_api_key is not None else settings.RELAYER_API_KEY
+        ak = (alchemy_api_key or "").strip() if alchemy_api_key is not None else settings.ALCHEMY_API_KEY
+
+        if not pk:
+            return {"ok": False, "error": "missing_private_key",
+                    "message": "Please enter or save your private key or seed phrase first."}
+        if not rk:
+            return {"ok": False, "error": "missing_relayer_api_key",
+                    "message": "A Polymarket Relayer API key is required to sponsor gasless wallet deployment and token approvals."}
+
         try:
-            receipts = self.gasless.set_all_approvals()
+            gasless = self._new_gasless_custom(3, pk, rk, ak)
+            receipts = gasless.set_all_approvals()
             self._approvals_done = True
             return {"ok": True, "approvals": len(receipts or [])}
         except Exception as e:
@@ -348,15 +368,18 @@ class ClobTrader:
     # on the CLOB client. (The build this was ported from reached for a `self.client`
     # attribute that does not exist, so both methods were dead there.)
 
-    def enable_auto_redeem(self) -> Dict[str, Any]:
+    def enable_auto_redeem(self, private_key: Optional[str] = None) -> Dict[str, Any]:
         """Ask Polymarket to auto-redeem resolved positions. Best-effort: if the
         account doesn't support it we fall back to redeeming explicitly."""
-        if not self.ensure_ready():
-            return {"ok": False, "error": self.last_error or "client_not_ready"}
-        if not hasattr(self.gasless, "auto_redeem_enable"):
-            return {"ok": False, "error": "auto_redeem_unsupported"}
+        pk = normalize_private_key(private_key) if private_key else settings.PRIVATE_KEY
+        if not pk:
+            return {"ok": False, "error": "missing_private_key",
+                    "message": "Please enter or save your private key or seed phrase first."}
         try:
-            res = self.gasless.auto_redeem_enable()
+            gasless = self.gasless if (self.ready and self.gasless is not None and not private_key) else self._new_gasless_custom(3, pk)
+            if not hasattr(gasless, "auto_redeem_enable"):
+                return {"ok": False, "error": "auto_redeem_unsupported"}
+            res = gasless.auto_redeem_enable()
             return {"ok": True, "result": str(res)}
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -439,33 +462,54 @@ class ClobTrader:
         except Exception:
             return None
 
-    def test_connection(self) -> Dict[str, Any]:
+    def test_connection(self, private_key: Optional[str] = None,
+                        relayer_api_key: Optional[str] = None,
+                        alchemy_api_key: Optional[str] = None) -> Dict[str, Any]:
         """Derive the EOA + its candidate wallets and report pUSD balances — shows
         which wallet holds the funds and which signature type will be used. Read-only
-        (no relayer key required)."""
-        if not settings.PRIVATE_KEY:
-            return {"ok": False, "error": "missing_private_key"}
+        (no relayer key required). Supports testing unsaved credentials."""
+        pk = normalize_private_key(private_key) if private_key else settings.PRIVATE_KEY
+        if not pk:
+            return {"ok": False, "error": "missing_private_key",
+                    "message": "Please enter a private key or seed phrase."}
         try:
             from eth_account import Account
-            eoa = Account.from_key(settings.PRIVATE_KEY).address
+            eoa = Account.from_key(pk).address
         except Exception as e:
             return {"ok": False, "error": f"invalid_key: {type(e).__name__}: {e}"}
         try:
-            probe = self._new_gasless(3)
+            rk = (relayer_api_key or "").strip() if relayer_api_key is not None else settings.RELAYER_API_KEY
+            ak = (alchemy_api_key or "").strip() if alchemy_api_key is not None else settings.ALCHEMY_API_KEY
+            probe = self._new_gasless_custom(3, pk, rk, ak)
             wallets = []
+            best_sig = 3
+            best_funder = None
+            best_bal = -1.0
+
             for st, addr in self._candidate_wallets(probe):
                 try:
                     bal = float(probe.get_pusd_balance(address=addr))
                 except Exception:
                     bal = None
                 wallets.append({"signature_type": st, "address": addr, "pusd_balance": bal})
-            sig_type, funder = self._pick_funded_wallet(probe)
+                if bal is not None and bal > best_bal:
+                    best_bal = bal
+                    best_sig = st
+                    best_funder = addr
+
+            if best_funder is None or best_bal <= 0:
+                best_sig = 3
+                try:
+                    best_funder = probe.get_expected_deposit_wallet()
+                except Exception:
+                    best_funder = None
+
             return {
                 "ok": True,
                 "eoa": eoa,
-                "chosen_signature_type": sig_type,
-                "funder": funder,
-                "relayer_key_set": bool(settings.RELAYER_API_KEY),
+                "chosen_signature_type": best_sig,
+                "funder": best_funder,
+                "relayer_key_set": bool(rk),
                 "wallets": wallets,
             }
         except Exception as e:
