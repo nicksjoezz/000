@@ -171,8 +171,11 @@ async def get_settings():
             "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE,
             "withdraw_amount": settings.WITHDRAW_AMOUNT,
             "withdraw_address": settings.WITHDRAW_ADDRESS,
+            "recipient_address": settings.WITHDRAW_ADDRESS,
+            "auto_resume": settings.WITHDRAW_AUTO_RESUME,
             "auto_resume_after_withdrawal": settings.WITHDRAW_AUTO_RESUME,
-            "resume_after": settings.WITHDRAW_RESUME_AFTER
+            "resume_after": settings.WITHDRAW_RESUME_AFTER,
+            "default_destination": (clob_trader.get_eoa_address() if clob_trader else "") or ""
         },
         "telegram": {
             "enabled": settings.TELEGRAM_ENABLED,
@@ -279,7 +282,14 @@ async def post_settings(new_settings: Dict[str, Any]):
 
     clob_trader.reset()
     state["trading_mode"] = settings.MODE
-    state["paper_balance"] = settings.PAPER_BALANCE_USD
+    if settings.MODE == "live" and settings.PRIVATE_KEY:
+        real_bal = await asyncio.to_thread(clob_trader.get_usdc_balance)
+        if real_bal is not None:
+            state["paper_balance"] = real_bal
+        else:
+            state["paper_balance"] = 0.0
+    else:
+        state["paper_balance"] = settings.PAPER_BALANCE_USD
 
     if settings.SYMBOL != old_symbol and _on_symbol_change_hook:
         await _on_symbol_change_hook(old_symbol, settings.SYMBOL)
@@ -295,55 +305,79 @@ async def validate_key(body: Dict[str, Any]):
 async def setup_wallet(body: Optional[Dict[str, Any]] = None):
     body = body or {}
     pk = body.get("private_key")
+    if pk and "..." not in pk:
+        from .config import normalize_private_key
+        try:
+            settings.PRIVATE_KEY = normalize_private_key(pk)
+        except Exception:
+            pass
     rk = body.get("relayer_api_key")
+    if rk and "..." not in rk:
+        settings.RELAYER_API_KEY = rk
     ak = body.get("alchemy_api_key")
+    if ak and "..." not in ak:
+        settings.ALCHEMY_API_KEY = ak
+    clob_trader.reset()
     try:
-        result = await asyncio.to_thread(clob_trader.ensure_setup, pk, rk, ak)
+        result = await asyncio.to_thread(clob_trader.ensure_setup)
         if result.get("ok"):
             if result.get("skipped"):
                 log_message("Wallet setup: already done this session")
             else:
                 log_message(f"Wallet setup complete ({result.get('approvals', 0)} approvals)")
         else:
-            msg = result.get("message") or result.get("error")
-            log_message(f"Wallet setup failed: {msg}")
+            log_message(f"Wallet setup failed: {result.get('error')}")
         return result
     except Exception as e:
         log_message(f"Wallet setup error: {e}")
-        return {"ok": False, "error": str(e), "message": str(e)}
+        return {"ok": False, "error": str(e)}
 
 @router.post("/api/test-connection")
 async def test_connection(body: Optional[Dict[str, Any]] = None):
     body = body or {}
     pk = body.get("private_key")
+    if pk and "..." not in pk:
+        from .config import normalize_private_key
+        try:
+            settings.PRIVATE_KEY = normalize_private_key(pk)
+        except Exception:
+            pass
     rk = body.get("relayer_api_key")
+    if rk and "..." not in rk:
+        settings.RELAYER_API_KEY = rk
     ak = body.get("alchemy_api_key")
+    if ak and "..." not in ak:
+        settings.ALCHEMY_API_KEY = ak
+    clob_trader.reset()
     try:
-        result = await asyncio.to_thread(clob_trader.test_connection, pk, rk, ak)
+        result = await asyncio.to_thread(clob_trader.test_connection)
         if result.get("ok"):
             log_message(f"Connection OK — EOA {result.get('eoa')}, trading from "
                         f"{result.get('funder')} (sig type {result.get('chosen_signature_type')})")
         else:
-            msg = result.get("message") or result.get("error")
-            log_message(f"Connection test failed: {msg}")
+            log_message(f"Connection test failed: {result.get('error')}")
         return result
     except Exception as e:
-        return {"ok": False, "error": str(e), "message": str(e)}
+        return {"ok": False, "error": str(e)}
 
 @router.post("/api/enable-auto-redeem")
 async def enable_auto_redeem(body: Optional[Dict[str, Any]] = None):
     body = body or {}
     pk = body.get("private_key")
+    if pk and "..." not in pk:
+        from .config import normalize_private_key
+        try:
+            settings.PRIVATE_KEY = normalize_private_key(pk)
+        except Exception:
+            pass
+    clob_trader.reset()
     try:
-        result = await asyncio.to_thread(clob_trader.enable_auto_redeem, pk)
-        if result.get("ok"):
-            log_message("Auto-redeem enabled")
-        else:
-            msg = result.get("message") or result.get("error")
-            log_message(f"Auto-redeem failed: {msg}")
+        result = await asyncio.to_thread(clob_trader.enable_auto_redeem)
+        log_message("Auto-redeem enabled" if result.get("ok")
+                    else f"Auto-redeem failed: {result.get('error')}")
         return result
     except Exception as e:
-        return {"ok": False, "error": str(e), "message": str(e)}
+        return {"ok": False, "error": str(e)}
 
 @router.get("/api/telegram-subscribers")
 async def get_telegram_subscribers():

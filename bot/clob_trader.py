@@ -19,7 +19,7 @@ All clients are synchronous — call from the event loop via `asyncio.to_thread`
 
 import threading
 from typing import Optional, Dict, Any, List, Tuple
-from .config import settings, normalize_private_key
+from .config import settings
 
 
 def _to_float(x) -> Optional[float]:
@@ -49,51 +49,53 @@ def _patch_clob_models():
         pass
 
 
-def _patch_market_order_rounding():
-    """Cap a MARKET order's derived amount at 4 decimals.
-
-    polymarket-apis rounds it to ROUNDING_CONFIG[tick].amount decimals, which is 5 on
-    a 0.001-tick market and 6 on a 0.0001-tick one. Every Polymarket BTC 15m market is
-    0.001-tick, so every live market order carried a 5-decimal share amount and the
-    CLOB rejected all of them outright:
-
-        HTTP 400 - invalid amounts, the market buy orders maker amount supports a max
-        accuracy of 2 decimals, taker amount a max of 4 decimals
-
-    4 is what the library itself uses on a 0.01-tick market, so this is its own
-    rounding applied to the finer ticks — not a new rule. Market orders only; the
-    limit-order path is left exactly as it was.
+def _patch_order_builder():
+    """Polymarket CLOB V2 strictly enforces:
+    - Market buy maker amount: max 2 decimals (collateral/USDC spent)
+    - Market buy taker amount: max 4 decimals (tokens/shares received)
+    The polymarket-apis library's default ROUNDING_CONFIG specifies amount=5 for 0.001
+    and amount=6 for 0.0001 tick sizes, which produces taker amounts with > 4 decimals.
+    Polymarket rejects these with:
+      HTTP 400 - invalid amounts, the market buy orders maker amount supports a max accuracy of 2 decimals, taker amount a max of 4 decimals.
+    This patch clamps ROUNDING_CONFIG to a maximum of 4 decimals and ensures exact integer divisibility:
+      maker amount is snapped to 10,000 (10^(6-2) -> max 2 decimals)
+      taker amount is snapped to 100 (10^(6-4) -> max 4 decimals)
     """
     try:
-        from dataclasses import replace
-        from polymarket_apis.utilities.order_builder import builder as ob
+        from polymarket_apis.utilities.order_builder.builder import OrderBuilder, ROUNDING_CONFIG, RoundConfig
+        for k, rc in list(ROUNDING_CONFIG.items()):
+            if rc.amount > 4:
+                ROUNDING_CONFIG[k] = RoundConfig(price=rc.price, size=rc.size, amount=min(4, rc.amount))
 
-        original = ob.OrderBuilder.get_market_order_amounts
+        orig_get_market = OrderBuilder.get_market_order_amounts
 
-        def capped(self, side, amount, price, round_config):
-            if round_config.amount > 4:
-                round_config = replace(round_config, amount=4)
-            return original(self, side, amount, price, round_config)
+        def safe_get_market_order_amounts(self, side: str, amount: float, price: float, round_config):
+            res_side, maker, taker = orig_get_market(self, side, amount, price, round_config)
+            if side == "BUY":
+                maker = (maker // 10_000) * 10_000
+                taker = (taker // 100) * 100
+            elif side == "SELL":
+                maker = (maker // 100) * 100
+                taker = (taker // 10_000) * 10_000
+            return res_side, maker, taker
 
-        ob.OrderBuilder.get_market_order_amounts = capped
-    except Exception:
-        pass
+        OrderBuilder.get_market_order_amounts = safe_get_market_order_amounts
+    except Exception as e:
+        print(f"Warning: Failed to patch OrderBuilder: {e}")
 
 
 _patch_clob_models()
-_patch_market_order_rounding()
+_patch_order_builder()
 
-
-PUSD_TOKEN = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
-USDC_E_TOKEN = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-USDC_NATIVE_TOKEN = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
-
-ERC20_BAL_ABI = [
-    {"name": "balanceOf", "inputs": [{"name": "account", "type": "address"}], "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
-]
 
 
 class ClobTrader:
+    _FILLED_STATUSES = ("matched", "delayed")
+    _PARTIAL_FILL_HINTS = (
+        "fully filled", "could not be filled", "fill or kill", "killed",
+        "unfilled", "insufficient liquidity", "not filled"
+    )
+
     def __init__(self):
         self.clob = None          # PolymarketClobClient — order placement
         self.gasless = None       # PolymarketGaslessWeb3Client — relayer on-chain ops
@@ -133,148 +135,58 @@ class ClobTrader:
         return self._api_creds
 
     def _new_gasless(self, signature_type: int):
-        return self._new_gasless_custom(signature_type, settings.PRIVATE_KEY,
-                                         settings.RELAYER_API_KEY, settings.ALCHEMY_API_KEY)
-
-    def _new_gasless_custom(self, signature_type: int, private_key: str,
-                            relayer_api_key: str = "", alchemy_api_key: str = ""):
+        # Gasless on-chain client. Two distinct roles:
+        #   - relayer key (or builder creds): SUBMITS txs and pays the gas
+        #   - rpc_url: READS chain state (pUSD balance, wallet derivation). Use Alchemy
+        #     when configured, else the library default.
         from polymarket_apis.clients.web3_client import PolymarketGaslessWeb3Client
-        from polymarket_apis.clients.clob_client import PolymarketClobClient
-        from eth_account import Account
-
-        pk = normalize_private_key(private_key)
-        rk = relayer_api_key.strip() if relayer_api_key else settings.RELAYER_API_KEY
-        ak = alchemy_api_key.strip() if alchemy_api_key else settings.ALCHEMY_API_KEY
-        rpc = f"https://polygon-mainnet.g.alchemy.com/v2/{ak}" if ak else settings.alchemy_rpc_url()
-
-        kwargs = {"private_key": pk, "signature_type": signature_type}
-        if rk:
-            kwargs["relayer_api_key"] = rk
+        kwargs = {"private_key": settings.PRIVATE_KEY, "signature_type": signature_type}
+        if settings.RELAYER_API_KEY:
+            kwargs["relayer_api_key"] = settings.RELAYER_API_KEY
         else:
-            eoa = Account.from_key(pk).address
-            c = PolymarketClobClient(private_key=pk, address=eoa, chain_id=137, signature_type=3)
-            kwargs["builder_creds"] = c.create_or_derive_api_creds()
-        if rpc:
-            kwargs["rpc_url"] = rpc
+            kwargs["builder_creds"] = self._derive_creds()
+        if settings.alchemy_rpc_url():
+            kwargs["rpc_url"] = settings.alchemy_rpc_url()
         return PolymarketGaslessWeb3Client(**kwargs)
 
-    def _query_address_balances(self, address: str, w3) -> Dict[str, float]:
-        """Query pUSD, USDC.e, native USDC, MATIC, and Polymarket Data-API value for an address."""
-        from web3 import Web3
-        import httpx
-
-        out = {
-            "pusd": 0.0,
-            "usdc_e": 0.0,
-            "usdc_native": 0.0,
-            "matic": 0.0,
-            "polymarket_value": 0.0,
-            "tradeable": 0.0,
-        }
-        if not address:
-            return out
-        try:
-            ca = Web3.to_checksum_address(address)
-        except Exception:
-            return out
-
-        try:
-            pusd = w3.eth.contract(address=Web3.to_checksum_address(PUSD_TOKEN), abi=ERC20_BAL_ABI)
-            out["pusd"] = float(pusd.functions.balanceOf(ca).call() / 1e6)
-        except Exception:
-            pass
-
-        try:
-            usdce = w3.eth.contract(address=Web3.to_checksum_address(USDC_E_TOKEN), abi=ERC20_BAL_ABI)
-            out["usdc_e"] = float(usdce.functions.balanceOf(ca).call() / 1e6)
-        except Exception:
-            pass
-
-        try:
-            usdcnat = w3.eth.contract(address=Web3.to_checksum_address(USDC_NATIVE_TOKEN), abi=ERC20_BAL_ABI)
-            out["usdc_native"] = float(usdcnat.functions.balanceOf(ca).call() / 1e6)
-        except Exception:
-            pass
-
-        try:
-            out["matic"] = float(w3.eth.get_balance(ca) / 1e18)
-        except Exception:
-            pass
-
-        try:
-            resp = httpx.get(f"https://data-api.polymarket.com/value?user={address}", timeout=3.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and data:
-                    out["polymarket_value"] = float(data[0].get("value", 0.0))
-        except Exception:
-            pass
-
-        out["tradeable"] = max(out["pusd"], out["usdc_e"], out["usdc_native"], out["polymarket_value"])
-        return out
-
-    def _candidate_wallets(self, gasless, eoa: Optional[str] = None) -> List[Tuple[int, str, str]]:
-        """(signature_type, address, label) candidates derived from the EOA:
-        - Signature Type 3: Deposit Wallet V2 (Polymarket)
-        - Signature Type 0: EOA / Signer (MetaMask)
-        - Signature Type 1: Poly Proxy (V1)
-        - Signature Type 2: Safe Proxy
-        """
-        out: List[Tuple[int, str, str]] = []
-        try:
-            dep = gasless.get_expected_deposit_wallet()
-            if dep:
-                out.append((3, dep, "Deposit Wallet (V2)"))
-        except Exception:
-            pass
-
-        if eoa:
-            out.append((0, eoa, "EOA / Signer (MetaMask)"))
-
-        for st, getter, label in (
-            (1, gasless.get_poly_proxy_wallet_address, "Polymarket Proxy (V1)"),
-            (2, gasless.get_safe_proxy_wallet_address, "Gnosis Safe"),
+    def _candidate_wallets(self, gasless) -> List[Tuple[int, str]]:
+        """(signature_type, address) candidates derived from the EOA, deposit-wallet
+        (V2) first, then legacy proxy / safe."""
+        out: List[Tuple[int, str]] = []
+        for st, getter in (
+            (3, gasless.get_expected_deposit_wallet),
+            (1, gasless.get_poly_proxy_wallet_address),
+            (2, gasless.get_safe_proxy_wallet_address),
         ):
             try:
-                addr = getter()
-                if addr:
-                    out.append((st, addr, label))
+                out.append((st, getter()))
             except Exception:
                 pass
         return out
 
-    def _pick_funded_wallet(self, gasless, eoa: Optional[str] = None) -> Tuple[int, str]:
-        """Trade from where the money actually is: pick candidate with detected funds.
+    def _pick_funded_wallet(self, gasless) -> Tuple[int, str]:
+        """Trade from where the money actually is: pick the candidate holding pUSD.
         Falls back to the deposit wallet when every balance reads 0."""
-        best_sig = 3
-        best_funder = None
-        best_bal = 0.0
-
-        candidates = self._candidate_wallets(gasless, eoa=eoa)
-        w3 = gasless.w3
-        for st, addr, _ in candidates:
-            bals = self._query_address_balances(addr, w3)
-            bal = bals.get("tradeable", 0.0)
-            if bal > best_bal:
-                best_bal = bal
-                best_sig = st
-                best_funder = addr
-
-        if best_funder and best_bal > 0:
-            return best_sig, best_funder
-
-        try:
-            return 3, gasless.get_expected_deposit_wallet()
-        except Exception:
-            return 3, eoa or ""
+        best = None  # (sig_type, addr, balance)
+        for st, addr in self._candidate_wallets(gasless):
+            try:
+                bal = float(gasless.get_pusd_balance(address=addr))
+            except Exception:
+                bal = 0.0
+            if bal > 0:
+                return st, addr
+            if best is None or bal > best[2]:
+                best = (st, addr, bal)
+        if best:
+            return best[0], best[1]
+        return 3, gasless.get_expected_deposit_wallet()
 
     def _init_clients(self):
         from polymarket_apis.clients.clob_client import PolymarketClobClient
-        from eth_account import Account
 
-        eoa = Account.from_key(settings.PRIVATE_KEY).address
+        # Any gasless client can derive every candidate address; probe with deposit.
         probe = self._new_gasless(3)
-        sig_type, funder = self._pick_funded_wallet(probe, eoa=eoa)
+        sig_type, funder = self._pick_funded_wallet(probe)
 
         gasless = probe if sig_type == 3 else self._new_gasless(sig_type)
 
@@ -311,50 +223,36 @@ class ClobTrader:
                 self.clob = None
                 return False
 
-    def ensure_setup(self, private_key: Optional[str] = None,
-                     relayer_api_key: Optional[str] = None,
-                     alchemy_api_key: Optional[str] = None) -> Dict[str, Any]:
+    def ensure_setup(self) -> Dict[str, Any]:
         """One-time gasless on-chain setup: deploy the deposit wallet (if needed) and
         set token approvals, sponsored by the relayer key. Required once before the
         first live order on a fresh deposit wallet."""
-        pk = normalize_private_key(private_key) if private_key else settings.PRIVATE_KEY
-        rk = (relayer_api_key or "").strip() if relayer_api_key is not None else settings.RELAYER_API_KEY
-        ak = (alchemy_api_key or "").strip() if alchemy_api_key is not None else settings.ALCHEMY_API_KEY
-
-        if not pk:
-            return {"ok": False, "error": "missing_private_key",
-                    "message": "Please enter or save your private key or seed phrase first."}
-        if not rk:
-            return {"ok": False, "error": "missing_relayer_api_key",
-                    "message": "A Polymarket Relayer API key is required to sponsor gasless wallet deployment and token approvals."}
-
+        if not self.ensure_ready():
+            return {"ok": False, "error": self.last_error or "client_not_ready"}
+        if self._approvals_done:
+            return {"ok": True, "skipped": "already_done"}
+        if not settings.RELAYER_API_KEY:
+            return {"ok": False, "error": "missing_relayer_api_key"}
         try:
-            gasless = self._new_gasless_custom(3, pk, rk, ak)
-            receipts = gasless.set_all_approvals()
+            receipts = self.gasless.set_all_approvals()
             self._approvals_done = True
             return {"ok": True, "approvals": len(receipts or [])}
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     # ── orders ──────────────────────────────────────────────────────────────────
-    # A Fill-Or-Kill order either fills completely or is KILLED. The old success test
-    # was `resp.get("success") is not False`, so a KILLED order was recorded as a
-    # filled position — a phantom trade with no fill behind it, and `shares` was always
-    # the estimate stake/quote rather than what was actually bought. Now a fill must be
-    # positively proven: success is true, the status says matched/delayed, AND non-zero
-    # amounts are reported on both legs. Anything else is a failure.
-    _FILLED_STATUSES = ("matched", "delayed")
-
-    def _market_order(self, token_id, amount, side: str, price) -> Dict[str, Any]:
+    def _market_order(self, token_id, amount, side: str, price, order_type=None) -> Dict[str, Any]:
         from polymarket_apis.types.clob_types import MarketOrderArgs, OrderType
+        ot = order_type if order_type is not None else OrderType.FAK
+        order_amount = round(float(amount), 2) if side == "BUY" else round(float(amount), 4)
         args = MarketOrderArgs(
             token_id=str(token_id),
-            amount=round(float(amount), 2),   # BUY: USDC to spend; SELL: shares to sell
+            amount=order_amount,              # BUY: USDC to spend (2 dec); SELL: shares to sell (up to 4 dec)
             side=side,                        # "BUY" / "SELL"
             price=round(float(price), 4) if price else 0,
-            order_type=OrderType.FOK,
+            order_type=ot,
         )
-        resp = self.clob.create_and_post_market_order(args)
+        resp = self.clob.create_and_post_market_order(args, order_type=ot)
         if resp is None:
             return {"ok": False, "error": "no_response_from_clob", "response": {}}
 
@@ -387,35 +285,34 @@ class ClobTrader:
 
         return {
             "ok": True, "response": data, "order_id": order_id, "status": status,
-            # REAL fill economics — never the quote we asked for. A FOK can fill
-            # anywhere up to the limit, so shares != amount/quote.
+            # REAL fill economics — never the quote we asked for.
             "fill_price": (usd / shares) if shares else None,
             "fill_size": shares,
             "fill_usd": usd,
         }
 
     def place_market_buy(self, token_id: str, usdc_amount: float, price: Optional[float] = None) -> Dict[str, Any]:
-        """Fill-Or-Kill marketable BUY for `usdc_amount` USDC of `token_id`. `price`
+        """Fill-And-Kill (FAK) marketable BUY for `usdc_amount` USDC of `token_id`. `price`
         is the current quote; the limit is quote + slippage buffer (capped < $1).
+        Executes strictly as FAK to fill available liquidity immediately without rejection.
         On success returns the ACTUAL fill_price / fill_size / fill_usd."""
         if not token_id:
             return {"ok": False, "error": "missing_token_id"}
         if not self.ensure_ready():
             return {"ok": False, "error": self.last_error or "client_not_ready"}
         # Ensure the deposit wallet is deployed + approved before the first order.
-        # A missing relayer key is tolerated: an already-set-up wallet trades fine
-        # without one, and a fresh wallet will simply fail at the order instead.
         setup = self.ensure_setup()
         if not setup.get("ok") and setup.get("error") != "missing_relayer_api_key":
             return {"ok": False, "error": f"setup_failed: {setup.get('error')}"}
         try:
+            from polymarket_apis.types.clob_types import OrderType
             limit = min(0.99, float(price) + settings.CLOB_MAX_SLIPPAGE) if price and price > 0 else 0
-            return self._market_order(token_id, usdc_amount, "BUY", limit)
+            return self._market_order(token_id, usdc_amount, "BUY", limit, order_type=OrderType.FAK)
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     def place_market_sell(self, token_id: str, size: float, price: Optional[float] = None) -> Dict[str, Any]:
-        """Fill-Or-Kill marketable SELL of `size` shares (used to exit / flip). Limit
+        """Fill-And-Kill (FAK) marketable SELL of `size` shares (used to exit / flip). Limit
         is quote − slippage buffer (floored at 1¢). On success returns the ACTUAL
         fill_price / fill_size / fill_usd."""
         if not token_id:
@@ -423,8 +320,9 @@ class ClobTrader:
         if not self.ensure_ready():
             return {"ok": False, "error": self.last_error or "client_not_ready"}
         try:
+            from polymarket_apis.types.clob_types import OrderType
             limit = max(0.01, float(price) - settings.CLOB_MAX_SLIPPAGE) if price and price > 0 else 0
-            return self._market_order(token_id, size, "SELL", limit)
+            return self._market_order(token_id, size, "SELL", limit, order_type=OrderType.FAK)
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -446,27 +344,15 @@ class ClobTrader:
                 "status": d.get("status"), "match_time": d.get("match_time")}
 
     # ── redemption ──────────────────────────────────────────────────────────────
-    # A winning position does NOT become spendable money on its own: it stays a CTF
-    # conditional token worth $1 that must be redeemed. Without this, live wins never
-    # show up in the pUSD balance and capital quietly strands — `get_pusd_balance`
-    # reads pUSD only and cannot see them.
-    #
-    # NOTE: redeem_position / auto_redeem_enable live on the GASLESS WEB3 client, not
-    # on the CLOB client. (The build this was ported from reached for a `self.client`
-    # attribute that does not exist, so both methods were dead there.)
-
-    def enable_auto_redeem(self, private_key: Optional[str] = None) -> Dict[str, Any]:
+    def enable_auto_redeem(self) -> Dict[str, Any]:
         """Ask Polymarket to auto-redeem resolved positions. Best-effort: if the
         account doesn't support it we fall back to redeeming explicitly."""
-        pk = normalize_private_key(private_key) if private_key else settings.PRIVATE_KEY
-        if not pk:
-            return {"ok": False, "error": "missing_private_key",
-                    "message": "Please enter or save your private key or seed phrase first."}
+        if not self.ensure_ready():
+            return {"ok": False, "error": self.last_error or "client_not_ready"}
+        if not hasattr(self.gasless, "auto_redeem_enable"):
+            return {"ok": False, "error": "auto_redeem_unsupported"}
         try:
-            gasless = self.gasless if (self.ready and self.gasless is not None and not private_key) else self._new_gasless_custom(3, pk)
-            if not hasattr(gasless, "auto_redeem_enable"):
-                return {"ok": False, "error": "auto_redeem_unsupported"}
-            res = gasless.auto_redeem_enable()
+            res = self.gasless.auto_redeem_enable()
             return {"ok": True, "result": str(res)}
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -490,52 +376,59 @@ class ClobTrader:
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    # ── withdrawal (auto capital extractor) ─────────────────────────────────────
+    # ── capital extractor / withdrawal ─────────────────────────────────────────
+    def get_funder(self) -> Optional[str]:
+        """Return the active funded wallet address (deposit/proxy/safe)."""
+        if self.funder:
+            return self.funder
+        if not settings.PRIVATE_KEY:
+            return None
+        try:
+            probe = self._new_gasless(3)
+            _, funder = self._pick_funded_wallet(probe)
+            return funder
+        except Exception:
+            return None
+
     def withdraw_pusd(self, recipient: str, amount: float) -> Dict[str, Any]:
-        """Transfer `amount` pUSD from the funded (deposit) wallet to `recipient`.
-        Gasless via the relayer. Used by the auto-withdrawal state machine."""
+        """Transfer pUSD from the funded deposit wallet to `recipient` via gasless relayer."""
         if not recipient:
-            return {"ok": False, "error": "missing_withdraw_address"}
-        if amount is None or float(amount) <= 0:
-            return {"ok": False, "error": "invalid_amount"}
+            return {"ok": False, "error": "missing_recipient_address"}
+        try:
+            from web3 import Web3
+            recipient = Web3.to_checksum_address(recipient)
+        except Exception as e:
+            return {"ok": False, "error": f"invalid_recipient_address: {e}"}
+        if amount <= 0:
+            return {"ok": False, "error": "invalid_withdraw_amount"}
         if not self.ensure_ready():
             return {"ok": False, "error": self.last_error or "client_not_ready"}
-        if not hasattr(self.gasless, "transfer_pusd"):
-            return {"ok": False, "error": "withdraw_unsupported_by_client"}
         try:
-            try:
-                from eth_utils import to_checksum_address
-                addr = to_checksum_address(recipient)
-            except Exception:
-                addr = recipient
-            receipt = self.gasless.transfer_pusd(addr, round(float(amount), 2))
-            tx = None
-            try:
-                data = receipt.model_dump() if hasattr(receipt, "model_dump") else dict(receipt)
-                tx = data.get("transaction_hash") or data.get("transactionHash") or data.get("hash")
-            except Exception:
-                tx = str(receipt) if receipt is not None else None
-            return {"ok": True, "tx": tx, "amount": round(float(amount), 2), "recipient": addr}
+            if hasattr(self.gasless, "withdraw_pusd"):
+                tx = self.gasless.withdraw_pusd(recipient, amount)
+            elif hasattr(self.gasless, "transfer_pusd"):
+                tx = self.gasless.transfer_pusd(recipient, amount)
+            else:
+                return {"ok": False, "error": "withdraw_unsupported_by_client"}
+            return {"ok": True, "tx": str(tx)}
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    def is_tx_confirmed(self, tx_hash: str) -> Optional[bool]:
-        """True/False once the receipt is readable, None while still unknown. Used by
-        the capital extractor when `resume_after` is set to `confirmed`."""
+    def is_tx_confirmed(self, tx_hash: str) -> bool:
+        """Check whether an on-chain transaction has confirmed on Polygon."""
         if not tx_hash:
-            return None
+            return False
         try:
+            if self.gasless and hasattr(self.gasless, "web3") and self.gasless.web3:
+                receipt = self.gasless.web3.eth.get_transaction_receipt(tx_hash)
+                return receipt is not None and receipt.get("status") == 1
             from web3 import Web3
             rpc = settings.alchemy_rpc_url() or settings.POLYGON_RPC_URL
-            if not rpc:
-                return None
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 6.0}))
+            w3 = Web3(Web3.HTTPProvider(rpc))
             receipt = w3.eth.get_transaction_receipt(tx_hash)
-            if receipt is None:
-                return None
-            return bool(receipt.get("status", 0) == 1)
+            return receipt is not None and receipt.get("status") == 1
         except Exception:
-            return None
+            return False
 
     # ── diagnostics / balance ───────────────────────────────────────────────────
     def get_eoa_address(self) -> Optional[str]:
@@ -549,109 +442,49 @@ class ClobTrader:
         except Exception:
             return None
 
-    def test_connection(self, private_key: Optional[str] = None,
-                        relayer_api_key: Optional[str] = None,
-                        alchemy_api_key: Optional[str] = None) -> Dict[str, Any]:
-        """Derive the EOA + candidate wallets (Deposit V2, EOA, Proxy, Safe) and report
-        balances across pUSD, USDC.e, native USDC, and Polymarket Data-API value.
-        Read-only (no relayer key required). Supports testing unsaved credentials."""
-        from concurrent.futures import ThreadPoolExecutor
-
-        pk = normalize_private_key(private_key) if private_key else settings.PRIVATE_KEY
-        if not pk:
-            return {"ok": False, "error": "missing_private_key",
-                    "message": "Please enter a private key or seed phrase."}
+    def test_connection(self) -> Dict[str, Any]:
+        """Derive the EOA + its candidate wallets and report pUSD balances — shows
+        which wallet holds the funds and which signature type will be used. Read-only
+        (no relayer key required)."""
+        if not settings.PRIVATE_KEY:
+            return {"ok": False, "error": "missing_private_key"}
         try:
             from eth_account import Account
-            eoa = Account.from_key(pk).address
+            eoa = Account.from_key(settings.PRIVATE_KEY).address
         except Exception as e:
             return {"ok": False, "error": f"invalid_key: {type(e).__name__}: {e}"}
         try:
-            rk = (relayer_api_key or "").strip() if relayer_api_key is not None else settings.RELAYER_API_KEY
-            ak = (alchemy_api_key or "").strip() if alchemy_api_key is not None else settings.ALCHEMY_API_KEY
-            probe = self._new_gasless_custom(3, pk, rk, ak)
-
-            candidates = self._candidate_wallets(probe, eoa=eoa)
-            w3 = probe.w3
-
-            def fetch_wallet_info(item):
-                st, addr, label = item
-                bals = self._query_address_balances(addr, w3)
-                return {
-                    "signature_type": st,
-                    "address": addr,
-                    "label": label,
-                    "pusd_balance": bals["pusd"],
-                    "usdce_balance": bals["usdc_e"],
-                    "usdc_native_balance": bals["usdc_native"],
-                    "polymarket_value": bals["polymarket_value"],
-                    "matic_balance": bals["matic"],
-                    "tradeable_balance": bals["tradeable"],
-                    "has_funds": bals["tradeable"] > 0
-                }
-
-            with ThreadPoolExecutor(max_workers=min(4, max(1, len(candidates)))) as pool:
-                wallets = list(pool.map(fetch_wallet_info, candidates))
-
-            best_sig = 3
-            best_funder = None
-            best_bal = 0.0
-            total_detected = 0.0
-
-            for w in wallets:
-                tb = w["tradeable_balance"]
-                total_detected += tb
-                if tb > best_bal:
-                    best_bal = tb
-                    best_sig = w["signature_type"]
-                    best_funder = w["address"]
-
-            if best_funder is None or best_bal <= 0:
-                best_sig = 3
+            probe = self._new_gasless(3)
+            wallets = []
+            for st, addr in self._candidate_wallets(probe):
                 try:
-                    best_funder = probe.get_expected_deposit_wallet()
+                    bal = float(probe.get_pusd_balance(address=addr))
                 except Exception:
-                    best_funder = eoa
-
-            advisory = ""
-            if total_detected > 0:
-                if best_sig == 3:
-                    advisory = f"Funds detected in your Polymarket Deposit Wallet (${best_bal:.2f}). Ready for live trading!"
-                elif best_sig == 0:
-                    advisory = f"Funds detected in your EOA (${best_bal:.2f}). To trade gasless on Polymarket V2, deposit your USDC to your Polymarket Deposit Wallet address ({best_funder})."
-                else:
-                    advisory = f"Funds detected in your Proxy/Safe wallet (${best_bal:.2f})."
-            else:
-                advisory = "No funds detected across your derived Polygon addresses ($0.00). If you see funds on polymarket.com, did you sign in with Google or Email? (Google logins use an embedded Magic wallet with a different address). Check your address on polymarket.com -> Profile."
-
+                    bal = None
+                wallets.append({"signature_type": st, "address": addr, "pusd_balance": bal})
+            sig_type, funder = self._pick_funded_wallet(probe)
             return {
                 "ok": True,
                 "eoa": eoa,
-                "chosen_signature_type": best_sig,
-                "funder": best_funder,
-                "relayer_key_set": bool(rk),
-                "total_detected_funds": round(total_detected, 2),
-                "advisory": advisory,
+                "chosen_signature_type": sig_type,
+                "funder": funder,
+                "relayer_key_set": bool(settings.RELAYER_API_KEY),
                 "wallets": wallets,
             }
         except Exception as e:
             return {"ok": False, "eoa": eoa, "error": f"{type(e).__name__}: {e}"}
 
     def get_usdc_balance(self) -> Optional[float]:
-        """Tradeable balance of the funded wallet (dollars), checking pUSD, USDC.e,
-        native USDC, and Polymarket portfolio value."""
+        """pUSD balance of the funded wallet (dollars), or None. pUSD is Polymarket's
+        V2 collateral; this is the deposit wallet's tradeable balance."""
         if not settings.PRIVATE_KEY:
             return None
         try:
-            from eth_account import Account
-            eoa = Account.from_key(settings.PRIVATE_KEY).address
             if self.ready and self.gasless is not None and self.funder:
-                bals = self._query_address_balances(self.funder, self.gasless.w3)
-                return float(bals.get("tradeable", 0.0))
+                return float(self.gasless.get_pusd_balance(address=self.funder))
             probe = self._new_gasless(3)
-            sig_type, funder = self._pick_funded_wallet(probe, eoa=eoa)
-            bals = self._query_address_balances(funder, probe.w3)
-            return float(bals.get("tradeable", 0.0))
+            _, funder = self._pick_funded_wallet(probe)
+            return float(probe.get_pusd_balance(address=funder))
         except Exception:
             return None
 
