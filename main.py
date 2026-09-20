@@ -18,6 +18,7 @@ from bot.settlement import (
     update_trades,
     mark_window_open_with_recovery,
     get_candle_window_timing,
+    closed_candles,
     POLY_WS_MAX_AGE_MS,
     ONCHAIN_MAX_AGE_MS
 )
@@ -281,6 +282,7 @@ async def evaluate_entry(trigger: str):
         "spotPrice": spot,
         "secondsLeft": time_left_min * 60,
         "minSecondsLeft": settings.MIN_SECONDS_LEFT,
+        "useIndicatorsOnly": ctx.get("use_indicators_only", settings.USE_INDICATORS_ONLY),
     })
     _last_eval_ts = now
     if decision["action"] != "ENTER":
@@ -452,10 +454,15 @@ async def update_loop():
             closes = [c["close"] for c in klines_1m]
             rsi_now = indicators.compute_rsi(closes, settings.RSI_PERIOD)
 
-            consec = indicators.count_consecutive(indicators.compute_heiken_ashi(klines_1m))
+            # HA candle source: closed candles only if USE_CANDLE_CLOSE_HA is enabled,
+            # otherwise developing real-time candles
+            ha_klines_1m = closed_candles(klines_1m) if settings.USE_CANDLE_CLOSE_HA else klines_1m
+            ha_klines_5m = closed_candles(klines_5m) if settings.USE_CANDLE_CLOSE_HA else klines_5m
+
+            consec = indicators.count_consecutive(indicators.compute_heiken_ashi(ha_klines_1m))
             consec_5m = {"color": None, "count": 0}
-            if len(klines_5m) >= 20:
-                consec_5m = indicators.count_consecutive(indicators.compute_heiken_ashi(klines_5m))
+            if len(ha_klines_5m) >= 20:
+                consec_5m = indicators.count_consecutive(indicators.compute_heiken_ashi(ha_klines_5m))
 
             # 15m EMA Macro Trend (20-period)
             ema_15m_data = indicators.evaluate_15m_ema(klines_15m, spot_price, period=settings.EMA_15M_PERIOD)
@@ -493,6 +500,7 @@ async def update_loop():
                 "spotPrice": spot_price,
                 "secondsLeft": time_left_min * 60 if time_left_min is not None else None,
                 "minSecondsLeft": settings.MIN_SECONDS_LEFT,
+                "useIndicatorsOnly": settings.USE_INDICATORS_ONLY,
             })
 
             current_prices_dict = {"spot": spot_price, "chainlink": current_price}
@@ -521,6 +529,8 @@ async def update_loop():
                     "ha_5m_colour": ha_5m_colour,
                     "ema_15m": ema_15m_data.get("ema"),
                     "ema_15m_data": ema_15m_data,
+                    "use_indicators_only": settings.USE_INDICATORS_ONLY,
+                    "use_candle_close_ha": settings.USE_CANDLE_CLOSE_HA,
                 }
             else:
                 state["trade_ctx"] = {}
@@ -605,6 +615,10 @@ async def update_loop():
                         "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE,
                         "amount": settings.WITHDRAW_AMOUNT,
                         "last": state["last_withdrawal"],
+                    },
+                    "strategy": {
+                        "use_indicators_only": settings.USE_INDICATORS_ONLY,
+                        "use_candle_close_ha": settings.USE_CANDLE_CLOSE_HA,
                     }
                 },
                 "prices": {
@@ -623,6 +637,7 @@ async def update_loop():
                     "rsi": rsi_now,
                     "heiken": consec,
                     "heiken_5m": consec_5m,
+                    "use_candle_close_ha": settings.USE_CANDLE_CLOSE_HA,
                     "ema_15m": ema_15m_data,
                     "fair": fair_data
                 },

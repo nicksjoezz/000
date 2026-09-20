@@ -25,24 +25,91 @@ def _no_ev(reason: str) -> Dict[str, Any]:
 
 
 def decide_ev(inputs: Dict[str, Any]) -> Dict[str, Any]:
-    """EV gate: fair probability (Binance) vs market ask price (Polymarket).
+    """Decision engine: EV gate or Indicators-Only mode.
 
-    EV_side = p_side - ask_price_side. A positive EV beyond `evThreshold` means the
-    book is underpricing the side our fast feed already favours — the latency edge.
-    Heiken-Ashi must then agree with the chosen direction on 15m, 5m and 1m, and RSI
-    can veto an extreme. None of them distort the probability — they only decide
-    whether the side EV picked may be traded. Position sizing (percent/fixed of
-    balance) is handled by the caller.
+    When `useIndicatorsOnly` is True:
+      Uses technical indicators exclusively (15m 20 EMA macro trend, 1m & 5m Heiken-Ashi
+      micro confirmation, and RSI veto) and completely ignores EV and min_prob.
+
+    When `useIndicatorsOnly` is False (default):
+      Runs EV gate: fair probability (Binance) vs market ask price (Polymarket).
+      EV_side = p_side - ask_price_side. A positive EV beyond `evThreshold` means the
+      book is underpricing the side our fast feed already favours — the latency edge.
     """
-    p_up = inputs.get("mcProbUp")
+    use_indicators_only = bool(inputs.get("useIndicatorsOnly", False))
     price_up = inputs.get("priceUp")     # ask (buy) price for the UP share, 0..1
     price_down = inputs.get("priceDown") # ask (buy) price for the DOWN share, 0..1
 
-    if p_up is None:
-        return _no_ev("missing_model_data")
     if price_up is None or price_down is None:
         return _no_ev("missing_prices")
 
+    p_up = inputs.get("mcProbUp")
+    if p_up is None:
+        return _no_ev("missing_model_data")
+
+    ema_15m = inputs.get("ema15m")
+    spot = inputs.get("spotPrice")
+    ema_period = inputs.get("emaPeriod", 20)
+
+    # ── BRANCH A: INDICATORS ONLY (Completely ignore EV) ──────────────────────
+    if use_indicators_only:
+        def _no_ind(reason: str) -> Dict[str, Any]:
+            return {"action": "NO_TRADE", "side": None, "phase": "INDICATORS", "strength": "INDICATORS", "reason": reason}
+
+        # 1. 15m 20 EMA Macro Trend determines permitted direction
+        if ema_15m is None or spot is None:
+            return _no_ind("ema15m_no_data")
+
+        if spot > ema_15m:
+            side = "UP"
+        elif spot < ema_15m:
+            side = "DOWN"
+        else:
+            return _no_ind(f"spot_{spot:.1f}_at_15m_{ema_period}ema_{ema_15m:.1f}")
+
+        # 2. Fair Probability must agree with the indicator direction:
+        # Strictly checks if Fair Prob UP % > Fair Prob DOWN % (for UP),
+        # or Fair Prob DOWN % > Fair Prob UP % (for DOWN). No min probability hurdle!
+        p_down = 1.0 - p_up
+        if side == "UP" and p_up <= p_down:
+            return _no_ind(f"fair_up_{p_up*100:.1f}%_le_down_{p_down*100:.1f}%")
+        if side == "DOWN" and p_down <= p_up:
+            return _no_ind(f"fair_down_{p_down*100:.1f}%_le_up_{p_up*100:.1f}%")
+
+        # 3. 1m + 5m Heiken-Ashi micro confirmation for the macro side
+        want = "green" if side == "UP" else "red"
+        for tf in ("1m", "5m"):
+            colour = inputs.get(f"ha{tf}Colour")
+            if colour != want:
+                return _no_ind(f"ha{tf}_{colour or 'no_data'}_blocks_{side.lower()}")
+
+        # 4. RSI extreme counter-trend veto
+        rsi = inputs.get("rsi")
+        rsi_overbought = inputs.get("rsiOverbought", 80.0)
+        rsi_oversold = inputs.get("rsiOversold", 20.0)
+        if rsi is not None:
+            if side == "UP" and rsi > rsi_overbought:
+                return _no_ind("rsi_overbought")
+            if side == "DOWN" and rsi < rsi_oversold:
+                return _no_ind("rsi_oversold")
+
+        # 4. Closing-seconds safety guard
+        seconds_left = inputs.get("secondsLeft")
+        min_seconds_left = inputs.get("minSecondsLeft", 30.0)
+        if seconds_left is None or seconds_left < min_seconds_left:
+            left_txt = "unknown" if seconds_left is None else f"{seconds_left:.0f}s"
+            return _no_ind(f"only_{left_txt}_left_below_{min_seconds_left:.0f}s")
+
+        price = price_up if side == "UP" else price_down
+        p = p_up if (p_up is not None and side == "UP") else ((1.0 - p_up) if p_up is not None else 0.6)
+        ev_val = (p - price) if (p is not None and price is not None) else None
+
+        return {
+            "action": "ENTER", "side": side, "phase": "INDICATORS", "strength": "STRONG",
+            "prob": p, "price": price, "ev": ev_val, "reason": "indicators_enter"
+        }
+
+    # ── BRANCH B: LATENCY-ARB EV ENTRY (Standard) ──────────────────────────────
     p_down = 1.0 - p_up
     ev_up = p_up - price_up
     ev_down = p_down - price_down

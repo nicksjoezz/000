@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     FLIP_MIN_CONVICTION: float = 0.80   # opposite side's adjusted prob must be >= this
     FLIP_MIN_MINUTES_LEFT: float = 9.0  # and at least this much time left in the window
 
+    # ── Strategy options ────────────────────────────────────────────────────────
+    USE_INDICATORS_ONLY: bool = False   # use only indicators (15m EMA, HA 1m/5m, RSI), completely ignore EV
+    USE_CANDLE_CLOSE_HA: bool = False   # use closed 1m & 5m candles for Heiken-Ashi, not real-time developing
+
     RSI_PERIOD: int = 14
     RSI_OVERBOUGHT: float = 80.0
     RSI_OVERSOLD: float = 20.0
@@ -275,12 +279,19 @@ def load_settings():
                 if "btc_usd_aggregator" in cl: base_settings.CHAINLINK_BTC_USD_AGGREGATOR = cl["btc_usd_aggregator"]
                 if "alchemy_api_key" in cl: base_settings.ALCHEMY_API_KEY = cl["alchemy_api_key"]
 
+            if "strategy" in config_data:
+                strat = config_data["strategy"]
+                if "use_indicators_only" in strat: base_settings.USE_INDICATORS_ONLY = bool(strat["use_indicators_only"])
+                if "use_candle_close_ha" in strat: base_settings.USE_CANDLE_CLOSE_HA = bool(strat["use_candle_close_ha"])
+
             if "indicators" in config_data:
                 ind = config_data["indicators"]
                 if "rsi_period" in ind: base_settings.RSI_PERIOD = int(ind["rsi_period"])
                 if "rsi_overbought" in ind: base_settings.RSI_OVERBOUGHT = float(ind["rsi_overbought"])
                 if "rsi_oversold" in ind: base_settings.RSI_OVERSOLD = float(ind["rsi_oversold"])
                 if "ema_15m_period" in ind: base_settings.EMA_15M_PERIOD = int(ind["ema_15m_period"])
+                if "use_indicators_only" in ind: base_settings.USE_INDICATORS_ONLY = bool(ind["use_indicators_only"])
+                if "use_candle_close_ha" in ind: base_settings.USE_CANDLE_CLOSE_HA = bool(ind["use_candle_close_ha"])
 
         except Exception as e:
             print(f"Warning: Failed to load config.json: {e}")

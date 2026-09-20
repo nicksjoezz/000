@@ -57,6 +57,10 @@
                       :class="data.trading_state?.withdraw?.state === 'ARMED' ? 'bg-gray-700 text-emerald-400' : 'bg-amber-600 text-white'"
                       :title="'Auto-withdraw: $' + (data.trading_state?.withdraw?.amount ?? '-') + ' once equity reaches $' + (data.trading_state?.withdraw?.trigger_balance ?? '-')"
                       x-text="'⤓ ' + (data.trading_state?.withdraw?.state || '')"></span>
+                <!-- Indicators Only strategy mode badge -->
+                <span x-show="data.trading_state?.strategy?.use_indicators_only"
+                      class="bg-indigo-700 text-white border border-indigo-500/60 px-2.5 py-1 rounded-full font-bold uppercase text-[10px] sm:text-xs"
+                      title="Strategy: Using technical indicators only (EV ignored)">Indicators Only</span>
                 <span :class="data.trading_state?.mode === 'paper' ? 'bg-yellow-600' : 'bg-red-600'"
                       class="px-3 py-1 rounded-full font-bold uppercase text-[10px] sm:text-xs" x-text="data.trading_state?.mode"></span>
                 <span class="bg-gray-800 px-3 py-1 rounded text-gray-400 text-[10px] sm:text-xs flex items-center gap-1.5"
@@ -145,12 +149,18 @@
                         </div>
                     </div>
                     <div class="flex justify-between text-sm sm:text-base">
-                        <span class="text-gray-400">Heiken Ashi (5m)</span>
+                        <div class="flex items-center gap-1.5">
+                            <span class="text-gray-400">Heiken Ashi (5m)</span>
+                            <span x-show="data.trading_state?.strategy?.use_candle_close_ha" class="text-[9px] text-purple-400 bg-purple-950/60 border border-purple-800/80 px-1 py-0.2 rounded font-bold uppercase">Closed</span>
+                        </div>
                         <span :class="data.indicators?.heiken_5m?.color === 'green' ? 'text-green-400' : (data.indicators?.heiken_5m?.color === 'red' ? 'text-red-400' : 'text-gray-500')"
                               x-text="data.indicators?.heiken_5m?.count != null ? (data.indicators?.heiken_5m?.color + ' x' + data.indicators?.heiken_5m?.count) : 'NaN'"></span>
                     </div>
                     <div class="flex justify-between text-sm sm:text-base">
-                        <span class="text-gray-400">Heiken Ashi (1m)</span>
+                        <div class="flex items-center gap-1.5">
+                            <span class="text-gray-400">Heiken Ashi (1m)</span>
+                            <span x-show="data.trading_state?.strategy?.use_candle_close_ha" class="text-[9px] text-purple-400 bg-purple-950/60 border border-purple-800/80 px-1 py-0.2 rounded font-bold uppercase">Closed</span>
+                        </div>
                         <span :class="data.indicators?.heiken?.color === 'green' ? 'text-green-400' : (data.indicators?.heiken?.color === 'red' ? 'text-red-400' : 'text-gray-500')"
                               x-text="data.indicators?.heiken?.count != null ? (data.indicators?.heiken?.color + ' x' + data.indicators?.heiken?.count) : 'NaN'"></span>
                     </div>

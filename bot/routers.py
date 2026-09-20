@@ -166,6 +166,10 @@ async def get_settings():
             "min_conviction": settings.FLIP_MIN_CONVICTION,
             "min_minutes_left": settings.FLIP_MIN_MINUTES_LEFT
         },
+        "strategy": {
+            "use_indicators_only": settings.USE_INDICATORS_ONLY,
+            "use_candle_close_ha": settings.USE_CANDLE_CLOSE_HA,
+        },
         "capital_extractor": {
             "enabled": settings.AUTO_WITHDRAW_ENABLED,
             "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE,
@@ -242,6 +246,20 @@ async def post_settings(new_settings: Dict[str, Any]):
             settings.FLIP_ENABLED = bool(f["enabled"])
         settings.FLIP_MIN_CONVICTION = float(f.get("min_conviction", settings.FLIP_MIN_CONVICTION))
         settings.FLIP_MIN_MINUTES_LEFT = float(f.get("min_minutes_left", settings.FLIP_MIN_MINUTES_LEFT))
+
+    if "strategy" in new_settings:
+        st = new_settings["strategy"]
+        if "use_indicators_only" in st:
+            settings.USE_INDICATORS_ONLY = bool(st["use_indicators_only"])
+        if "use_candle_close_ha" in st:
+            settings.USE_CANDLE_CLOSE_HA = bool(st["use_candle_close_ha"])
+
+    if "indicators" in new_settings:
+        ind = new_settings["indicators"]
+        if "use_indicators_only" in ind:
+            settings.USE_INDICATORS_ONLY = bool(ind["use_indicators_only"])
+        if "use_candle_close_ha" in ind:
+            settings.USE_CANDLE_CLOSE_HA = bool(ind["use_candle_close_ha"])
 
     if "capital_extractor" in new_settings:
         ce = new_settings["capital_extractor"]

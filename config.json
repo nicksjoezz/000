@@ -4,18 +4,23 @@
   "private_key": "",
   "live": {
     "max_slippage": 0.02,
-    "exit_max_retries": 3
+    "exit_max_retries": 3,
+    "relayer_api_key": "",
+    "alchemy_api_key": "DfkvQ8...2sG0"
   },
   "relayer": {
     "api_key": ""
   },
   "capital_extractor": {
     "enabled": false,
-    "trigger_balance": 76000,
-    "withdraw_amount": 75000,
+    "trigger_balance": 76000.0,
+    "withdraw_amount": 75000.0,
     "withdraw_address": "",
     "auto_resume_after_withdrawal": true,
-    "resume_after": "submitted"
+    "resume_after": "submitted",
+    "recipient_address": "",
+    "auto_resume": true,
+    "default_destination": ""
   },
   "telegram": {
     "enabled": true,
@@ -44,8 +49,8 @@
   "ev": {
     "ev_threshold": 0.04,
     "min_prob": 0.55,
-    "min_book_liquidity_usd": 20,
-    "min_seconds_left": 30
+    "min_book_liquidity_usd": 20.0,
+    "min_seconds_left": 30.0
   },
   "settlement": {
     "authoritative_settle_wait_s": 90
@@ -53,7 +58,7 @@
   "flip": {
     "enabled": false,
     "min_conviction": 0.65,
-    "min_minutes_left": 4
+    "min_minutes_left": 4.0
   },
   "chainlink": {
     "polygon_rpc_url": "https://polygon.drpc.org",
@@ -66,5 +71,9 @@
     "rsi_period": 14,
     "rsi_overbought": 80.0,
     "rsi_oversold": 20.0
+  },
+  "strategy": {
+    "use_indicators_only": false,
+    "use_candle_close_ha": false
   }
 }
