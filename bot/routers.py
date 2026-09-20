@@ -194,6 +194,17 @@ async def post_settings(new_settings: Dict[str, Any]):
     if isinstance(new_settings.get("telegram"), dict) and new_settings["telegram"].get("bot_token") == "set":
         new_settings["telegram"].pop("bot_token", None)
 
+    if isinstance(new_settings.get("live"), dict):
+        lv = new_settings["live"]
+        rk = lv.pop("relayer_api_key", None)
+        if rk and "..." not in rk:
+            settings.RELAYER_API_KEY = rk
+            new_settings.setdefault("relayer", {})["api_key"] = rk
+        ak = lv.pop("alchemy_api_key", None)
+        if ak and "..." not in ak:
+            settings.ALCHEMY_API_KEY = ak
+            new_settings.setdefault("chainlink", {})["alchemy_api_key"] = ak
+
     new_pk = new_settings.get("private_key")
     if new_pk and "..." in new_pk:
         new_settings["private_key"] = settings.PRIVATE_KEY
@@ -209,6 +220,9 @@ async def post_settings(new_settings: Dict[str, Any]):
         try:
             with open("config.json", "r", encoding="utf-8") as f:
                 existing_cfg = json.load(f)
+            if isinstance(existing_cfg.get("live"), dict):
+                existing_cfg["live"].pop("relayer_api_key", None)
+                existing_cfg["live"].pop("alchemy_api_key", None)
         except Exception:
             existing_cfg = {}
 
@@ -285,18 +299,6 @@ async def post_settings(new_settings: Dict[str, Any]):
         lv = new_settings["live"]
         if "max_slippage" in lv:
             settings.CLOB_MAX_SLIPPAGE = float(lv["max_slippage"])
-        rk = lv.get("relayer_api_key")
-        if rk and "..." not in rk:
-            settings.RELAYER_API_KEY = rk
-            new_settings.setdefault("relayer", {})["api_key"] = rk
-        elif rk:
-            lv["relayer_api_key"] = settings.RELAYER_API_KEY
-        ak = lv.get("alchemy_api_key")
-        if ak and "..." not in ak:
-            settings.ALCHEMY_API_KEY = ak
-            new_settings.setdefault("chainlink", {})["alchemy_api_key"] = ak
-        elif ak:
-            lv["alchemy_api_key"] = settings.ALCHEMY_API_KEY
 
     clob_trader.reset()
     state["trading_mode"] = settings.MODE

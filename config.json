@@ -4,9 +4,7 @@
   "private_key": "",
   "live": {
     "max_slippage": 0.02,
-    "exit_max_retries": 3,
-    "relayer_api_key": "",
-    "alchemy_api_key": "DfkvQ8...2sG0"
+    "exit_max_retries": 3
   },
   "relayer": {
     "api_key": ""
